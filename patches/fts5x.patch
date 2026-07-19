@@ -1,0 +1,157 @@
+diff -ru a/vendor/ext/fts5/fts5Int.h b/vendor/ext/fts5/fts5Int.h
+--- a/vendor/ext/fts5/fts5Int.h	2026-04-03 02:22:16.669949573 +0000
++++ b/vendor/ext/fts5/fts5Int.h	2026-04-03 02:22:16.652651248 +0000
+@@ -197,6 +197,7 @@
+   char *zContentRowid;            /* "content_rowid=" option value */ 
+   int bColumnsize;                /* "columnsize=" option value (dflt==1) */
+   int bTokendata;                 /* "tokendata=" option value (dflt==0) */
++  int nStoreOffsets;              /* "store_offsets=" byte interval (0=off) */
+   int eDetail;                    /* FTS5_DETAIL_XXX value */
+   char *zContentExprlist;
+   Fts5Tokenizer *pTok;
+diff -ru a/vendor/ext/fts5/fts5_config.c b/vendor/ext/fts5/fts5_config.c
+--- a/vendor/ext/fts5/fts5_config.c	2026-04-03 02:22:16.679107510 +0000
++++ b/vendor/ext/fts5/fts5_config.c	2026-04-03 02:22:16.654686345 +0000
+@@ -408,6 +408,17 @@
+     return rc;
+   }
+ 
++  if( sqlite3_strnicmp("store_offsets", zCmd, nCmd)==0 ){
++    int v = atoi(zArg);
++    if( v<0 ){
++      *pzErr = sqlite3_mprintf("malformed store_offsets=... directive");
++      rc = SQLITE_ERROR;
++    }else{
++      pConfig->nStoreOffsets = v;
++    }
++    return rc;
++  }
++
+   *pzErr = sqlite3_mprintf("unrecognized option: \"%.*s\"", nCmd, zCmd);
+   return SQLITE_ERROR;
+ }
+diff -ru a/vendor/ext/fts5/fts5_main.c b/vendor/ext/fts5/fts5_main.c
+--- a/vendor/ext/fts5/fts5_main.c	2026-04-03 02:22:16.691318092 +0000
++++ b/vendor/ext/fts5/fts5_main.c	2026-04-03 02:22:16.662826734 +0000
+@@ -3032,7 +3032,7 @@
+     pGlobal->api.xCreateFunction = fts5CreateAux;
+     pGlobal->api.xCreateTokenizer = fts5CreateTokenizer;
+     pGlobal->api.xFindTokenizer = fts5FindTokenizer;
+-    rc = sqlite3_create_module_v2(db, "fts5", &fts5Mod, p, fts5ModuleDestroy);
++    rc = sqlite3_create_module_v2(db, "fts5x", &fts5Mod, p, fts5ModuleDestroy);
+     if( rc==SQLITE_OK ) rc = sqlite3Fts5IndexInit(db);
+     if( rc==SQLITE_OK ) rc = sqlite3Fts5ExprInit(pGlobal, db);
+     if( rc==SQLITE_OK ) rc = sqlite3Fts5AuxInit(&pGlobal->api);
+diff -ru a/vendor/ext/fts5/fts5_storage.c b/vendor/ext/fts5/fts5_storage.c
+--- a/vendor/ext/fts5/fts5_storage.c	2026-04-03 02:22:16.685212801 +0000
++++ b/vendor/ext/fts5/fts5_storage.c	2026-04-03 02:22:16.659774088 +0000
+@@ -376,6 +376,8 @@
+   Fts5Storage *pStorage;
+   int iCol;
+   int szCol;                      /* Size of column value in tokens */
++  Fts5Buffer offsets;             /* Last token per frame (store_offsets) */
++  int nOffsetEntries;             /* Number of frame entries recorded */
+ };
+ 
+ /*
+@@ -386,16 +388,29 @@
+   int tflags,
+   const char *pToken,             /* Buffer containing token */
+   int nToken,                     /* Size of token in bytes */
+-  int iUnused1,                   /* Start offset of token */
+-  int iUnused2                    /* End offset of token */
++  int iStart,                     /* Start byte offset of token */
++  int iEnd                        /* End byte offset of token */
+ ){
+   Fts5InsertCtx *pCtx = (Fts5InsertCtx*)pContext;
+   Fts5Index *pIdx = pCtx->pStorage->pIndex;
+-  UNUSED_PARAM2(iUnused1, iUnused2);
++  int nInterval = pCtx->pStorage->pConfig->nStoreOffsets;
++  UNUSED_PARAM(iEnd);
+   if( nToken>FTS5_MAX_TOKEN_SIZE ) nToken = FTS5_MAX_TOKEN_SIZE;
+   if( (tflags & FTS5_TOKEN_COLOCATED)==0 || pCtx->szCol==0 ){
+     pCtx->szCol++;
+   }
++
++  /* store_offsets: when a token crosses into a new frame, record the last
++  ** token of the previous frame. entry[i] = last token in frame i. */
++  if( nInterval>0 && pCtx->iCol==0 ){
++    int iFrame = iStart / nInterval;
++    while( pCtx->nOffsetEntries < iFrame ){
++      int rc2 = SQLITE_OK;
++      sqlite3Fts5BufferAppendVarint(&rc2, &pCtx->offsets, (i64)(pCtx->szCol-2));
++      pCtx->nOffsetEntries++;
++    }
++  }
++
+   return sqlite3Fts5IndexWrite(pIdx, pCtx->iCol, pCtx->szCol-1, pToken, nToken);
+ }
+ 
+@@ -801,6 +816,7 @@
+   Fts5Buffer buf;                 /* Buffer used to build up %_docsize blob */
+ 
+   memset(&buf, 0, sizeof(Fts5Buffer));
++  memset(&ctx, 0, sizeof(ctx));
+   ctx.pStorage = p;
+   rc = fts5StorageLoadTotals(p, 1);
+ 
+@@ -812,7 +828,7 @@
+     if( pConfig->abUnindexed[ctx.iCol]==0 ){
+       const char *zText = (const char*)sqlite3_value_text(apVal[ctx.iCol+2]);
+       int nText = sqlite3_value_bytes(apVal[ctx.iCol+2]);
+-      rc = sqlite3Fts5Tokenize(pConfig, 
++      rc = sqlite3Fts5Tokenize(pConfig,
+           FTS5_TOKENIZE_DOCUMENT,
+           zText, nText,
+           (void*)&ctx,
+@@ -824,11 +840,22 @@
+   }
+   p->nTotalRow++;
+ 
++  /* store_offsets: finalize last frame and append to docsize blob. */
++  if( pConfig->nStoreOffsets>0 && ctx.szCol>0 ){
++    sqlite3Fts5BufferAppendVarint(&rc, &ctx.offsets, (i64)(ctx.szCol-1));
++    ctx.nOffsetEntries++;
++    sqlite3Fts5BufferAppendVarint(&rc, &buf, (i64)ctx.nOffsetEntries);
++    if( ctx.offsets.n ){
++      sqlite3Fts5BufferAppendBlob(&rc, &buf, ctx.offsets.n, ctx.offsets.p);
++    }
++  }
++
+   /* Write the %_docsize record */
+   if( rc==SQLITE_OK ){
+     rc = fts5StorageInsertDocsize(p, iRowid, &buf);
+   }
+   sqlite3_free(buf.p);
++  sqlite3_free(ctx.offsets.p);
+ 
+   return rc;
+ }
+@@ -1096,7 +1123,8 @@
+ 
+ static int fts5StorageDecodeSizeArray(
+   int *aCol, int nCol,            /* Array to populate */
+-  const u8 *aBlob, int nBlob      /* Record to read varints from */
++  const u8 *aBlob, int nBlob,     /* Record to read varints from */
++  int bHasOffsets                 /* Trailing store_offsets data present */
+ ){
+   int i;
+   int iOff = 0;
+@@ -1104,7 +1132,7 @@
+     if( iOff>=nBlob ) return 1;
+     iOff += fts5GetVarint32(&aBlob[iOff], aCol[i]);
+   }
+-  return (iOff!=nBlob);
++  return bHasOffsets ? (iOff>nBlob) : (iOff!=nBlob);
+ }
+ 
+ /*
+@@ -1129,7 +1157,7 @@
+     if( SQLITE_ROW==sqlite3_step(pLookup) ){
+       const u8 *aBlob = sqlite3_column_blob(pLookup, 0);
+       int nBlob = sqlite3_column_bytes(pLookup, 0);
+-      if( 0==fts5StorageDecodeSizeArray(aCol, nCol, aBlob, nBlob) ){
++      if( 0==fts5StorageDecodeSizeArray(aCol, nCol, aBlob, nBlob, p->pConfig->nStoreOffsets>0) ){
+         bCorrupt = 0;
+       }
+     }
