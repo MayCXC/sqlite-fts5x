@@ -11,13 +11,21 @@ recovered by seekable decompression of just that frame, never a full-document re
 Paired with external content (`content='...'`), the index holds tokens only, no copy
 of the source text.
 
-Auxiliary functions:
+## Auxiliary functions
 
-- `match_tokens(fts)` — matched token text from the inverted index (no content read)
-- `match_position(fts)` — token offset of the first match (from `xInst`)
-- `offset_lookup(docsize, nCol, tokPos, interval)` — byte offset of the frame holding a token
-- `snippet_text(text, tokens, open, close, ellipsis, n)` — highlight matched tokens in a text
-- `tokenize(text)` — the FTS5 `unicode61` tokenizer as a scalar
+- `match_tokens(fts)`: matched token text from the inverted index (no content read)
+- `match_position(fts)`: token offset of the first match (from `xInst`)
+- `offset_lookup(docsize, nCol, tokPos, interval)`: byte offset of the frame holding a token
+- `snippet_text(text, tokens, open, close, ellipsis, n)`: highlight matched tokens in a text
+- `tokenize(text)`: the FTS5 `unicode61` tokenizer as a scalar
+
+`match_tokens` is the text expression the companion
+[`sqlite-mmr`](https://github.com/MayCXC/sqlite-mmr) extension consumes: its `mmr`
+virtual table reranks an FTS5 MATCH for diversity by Jaccard similarity over token
+sets, and `match_tokens` feeds it clean, already-tokenized text straight from the
+index with no content decompression. `offset_lookup` and `snippet_text` together
+recover the highlighted snippet for a hit from its stored frame, so neither the
+reranker nor the snippet path ever reads the full document.
 
 ## Build
 
