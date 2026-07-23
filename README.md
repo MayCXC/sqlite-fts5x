@@ -19,13 +19,10 @@ of the source text.
 - `snippet_text(text, tokens, open, close, ellipsis, n)`: highlight matched tokens in a text
 - `tokenize(text)`: the FTS5 `unicode61` tokenizer as a scalar
 
-`match_tokens` is the text expression the companion
-[`sqlite-mmr`](https://github.com/MayCXC/sqlite-mmr) extension consumes: its `mmr`
-virtual table reranks an FTS5 MATCH for diversity by Jaccard similarity over token
-sets, and `match_tokens` feeds it clean, already-tokenized text straight from the
-index with no content decompression. `offset_lookup` and `snippet_text` together
-recover the highlighted snippet for a hit from its stored frame, so neither the
-reranker nor the snippet path ever reads the full document.
+These outputs make fts5x a building block for a larger search stack: `offset_lookup` gives a
+hit's byte range, so a seekable store like [`sqlite-zstd`](https://github.com/MayCXC/sqlite-zstd)
+can decompress just the snippet, and `match_tokens` gives clean tokens for a reranker like
+[`sqlite-mmr`](https://github.com/MayCXC/sqlite-mmr), neither reading the full document.
 
 ## Build
 
