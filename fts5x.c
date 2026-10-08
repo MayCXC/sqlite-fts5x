@@ -78,6 +78,47 @@ static void fts5x_match_position(const Fts5ExtensionApi *pApi,
   sqlite3_result_int(pCtx, iO);
 }
 
+/* ---- bm25w() --------------------------------------------------------- */
+/* bm25w(fts, w0, w1, ...): bm25() with one weight per phrase of the query in
+** place of one per column. Phrase i's term of the BM25 sum is multiplied by
+** wi (1.0 for a phrase past the last weight), which scores a weighted bag of
+** terms as Lucene scores a BooleanQuery of boosted TermQuery clauses under
+** BM25, the form Anserini's Rm3Reranker runs its expanded query in. The IDFs
+** and the average row length come from FTS5's own fts5Bm25GetData (fts5_aux.c,
+** included above) and each term is bm25()'s expression, so unit weights give
+** bm25()'s score; it is negated the same way, so ORDER BY rank puts the best
+** match first. Reach it per query with rank MATCH 'bm25w(w0, w1, ...)'.
+** https://www.sqlite.org/fts5.html#the_bm25_function
+** https://github.com/castorini/anserini/blob/master/src/main/java/io/anserini/rerank/lib/Rm3Reranker.java */
+static void fts5x_bm25w(const Fts5ExtensionApi *pApi,
+    Fts5Context *pFts, sqlite3_context *pCtx, int nVal, sqlite3_value **apVal) {
+  const double k1 = 1.2, b = 0.75;
+  Fts5Bm25Data *pData = 0;
+  int nInst = 0, nTok = 0;
+  int rc = fts5Bm25GetData(pApi, pFts, &pData);
+  if (rc == SQLITE_OK) {
+    memset(pData->aFreq, 0, sizeof(double) * pData->nPhrase);
+    rc = pApi->xInstCount(pFts, &nInst);
+  }
+  for (int i = 0; rc == SQLITE_OK && i < nInst; i++) {
+    int ip, ic, io;
+    rc = pApi->xInst(pFts, i, &ip, &ic, &io);
+    if (rc == SQLITE_OK) pData->aFreq[ip] += 1.0;
+  }
+  if (rc == SQLITE_OK) rc = pApi->xColumnSize(pFts, -1, &nTok);
+  if (rc != SQLITE_OK) { sqlite3_result_error_code(pCtx, rc); return; }
+  double D = (double)nTok, score = 0.0;
+  for (int i = 0; i < pData->nPhrase; i++) {
+    double w = i < nVal ? sqlite3_value_double(apVal[i]) : 1.0;
+    double *aFreq = pData->aFreq;
+    score += w * (pData->aIDF[i] * (
+        ( aFreq[i] * (k1 + 1.0) ) /
+        ( aFreq[i] + k1 * (1 - b + b * D / pData->avgdl) )
+    ));
+  }
+  sqlite3_result_double(pCtx, -1.0 * score);
+}
+
 /* ---- tokenize() ------------------------------------------------------ */
 typedef struct { fts5_tokenizer tok; Fts5Tokenizer *pTok; } Fts5ExtGlobal;
 static int fts5x_tok_cb(void *p, int f, const char *t, int n, int s, int e) {
@@ -174,6 +215,8 @@ int sqlite3_fts5x_init(sqlite3 *db, char **pzErrMsg,
   rc = pFtsApi->xCreateFunction(pFtsApi, "match_tokens", 0, fts5x_match_tokens, 0);
   if (rc != SQLITE_OK) return rc;
   rc = pFtsApi->xCreateFunction(pFtsApi, "match_position", 0, fts5x_match_position, 0);
+  if (rc != SQLITE_OK) return rc;
+  rc = pFtsApi->xCreateFunction(pFtsApi, "bm25w", 0, fts5x_bm25w, 0);
   if (rc != SQLITE_OK) return rc;
 
   Fts5ExtGlobal *g = sqlite3_malloc(sizeof(*g)); memset(g, 0, sizeof(*g));

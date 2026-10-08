@@ -15,6 +15,9 @@ of the source text.
 
 - `match_tokens(fts)`: matched token text from the inverted index (no content read)
 - `match_position(fts)`: token offset of the first match (from `xInst`)
+- `bm25w(fts, w0, w1, ...)`: `bm25()` with a weight per phrase of the query instead of per
+  column, phrase `i`'s term of the sum multiplied by `wi`; it scores a weighted bag of terms,
+  such as an RM3 expanded query, and is reached per query with `rank MATCH 'bm25w(...)'`
 - `offset_lookup(docsize, nCol, tokPos, interval)`: byte offset of the frame holding a token
 - `snippet_text(text, tokens, open, close, ellipsis, n)`: highlight matched tokens in a text
 - `tokenize(text)`: the FTS5 `unicode61` tokenizer as a scalar
@@ -28,6 +31,7 @@ can decompress just the snippet, and `match_tokens` gives clean tokens for a rer
 
     make vendor   # fetch SQLite's fts5 sources and apply patches/fts5x.patch
     make          # -> fts5x.so
+    make test     # checks bm25w against bm25 with the sqlite3 shell
 
 `make vendor` downloads the pinned SQLite amalgamation (`SQLITE_VERSION` in the
 Makefile), extracts the FTS5 sources and the `lemon` parser tool, and applies
