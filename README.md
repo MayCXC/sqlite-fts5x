@@ -41,12 +41,41 @@ per tokenizer, the tokenizer's name and each of its arguments given as a module 
 Each row is one token, its byte range in the input and its token position, so counting a
 text's terms is a `GROUP BY token` over it.
 
+## RM3 table
+
+`fts5rm3` is relevance feedback for an FTS5 table, as [Anserini's
+Rm3Reranker](https://github.com/castorini/anserini/blob/master/src/main/java/io/anserini/rerank/lib/Rm3Reranker.java)
+builds it in explicit-feedback mode: a query model from the query's tokens, a feedback
+model from a text judged relevant, and the two mixed. Create one per FTS5 table and query
+it with the feedback text and the query:
+
+    CREATE VIRTUAL TABLE temp.rm3 USING fts5rm3(docs);         -- main.docs
+    SELECT match, rank, terms FROM temp.rm3 WHERE feedback = ? AND query = ?;
+
+    SELECT d.rowid FROM docs d, temp.rm3 r
+    WHERE r.feedback = ? AND r.query = ? AND d.docs MATCH r.match AND d.rank MATCH r.rank
+    ORDER BY d.rank;
+
+The feedback model is the feedback text's tokens of `shortest` to `longest` `[a-z0-9]`
+characters held by no more than `common` of the table's rows, the heaviest `expand` of
+them by count, each weighted by its share of those; the query model weights each query
+token by its share of them; the result is `mix` of each. Tokens come from the table's own
+tokenizer and row counts from its own index. `match` is the model as a flat OR of its
+terms, one phrase each, and `rank` is `bm25w(...)` with the weights in phrase order, both
+ordered by term, so the pair ranks the expanded query directly. `terms` is how many
+feedback terms were kept; with none and no query token, `match` and `rank` are NULL.
+
+The parameters are hidden columns with Anserini's values as defaults: `expand` 10,
+`common` 0.1, `shortest` 2, `longest` 20, `mix` 0.5. Every argument can come from another
+table in the same query, so one statement can run feedback per row.
+
 ## Build
 
     make vendor   # fetch SQLite's fts5 sources and apply patches/fts5x.patch
     make          # -> fts5x.so
-    make test     # checks bm25w against bm25, and fts5tokenize against the index and
-                  # tokenize(), with the sqlite3 shell
+    make test     # checks bm25w against bm25, fts5tokenize against the index and
+                  # tokenize(), and fts5rm3 against the RM3 statement, with the
+                  # sqlite3 shell
 
 `make vendor` downloads the pinned SQLite amalgamation (`SQLITE_VERSION` in the
 Makefile), extracts the FTS5 sources and the `lemon` parser tool, and applies

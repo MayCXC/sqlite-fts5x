@@ -208,6 +208,323 @@ done:
   for(int i=0;i<toks.n;i++) sqlite3_free(toks.a[i].z); sqlite3_free(toks.a);
   for(int i=0;i<nS;i++) sqlite3_free(aS[i]); sqlite3_free(aS); }
 
+/* ---- fts5rm3 --------------------------------------------------------- */
+/* RM3 relevance feedback over an FTS5 table, as one row:
+**
+**   CREATE VIRTUAL TABLE temp.rm3 USING fts5rm3(fts);        -- main.fts
+**   CREATE VIRTUAL TABLE temp.rm3 USING fts5rm3(aux, fts);   -- aux.fts
+**   SELECT match, rank, terms FROM temp.rm3 WHERE feedback = ? AND query = ?;
+**
+** RM3 in explicit-feedback mode, as Anserini's Rm3Reranker builds it. The query
+** model is the query's tokens, each weighted by its share of them. The feedback
+** model is the feedback text's tokens of `shortest` to `longest` [a-z0-9]
+** characters held by no more than `common` of the table's rows, the heaviest
+** `expand` of them by count, each weighted by its share of those. The final
+** model is `mix` of each. Tokens come from the table's own tokenizer and a
+** term's rows from its own index, so the model is in the index's terms; a
+** term's rows are counted only until it proves common, and only until `expand`
+** terms are kept, since the heaviest terms are tried first.
+** https://github.com/castorini/anserini/blob/master/src/main/java/io/anserini/rerank/lib/Rm3Reranker.java
+**
+** The model comes out as the two strings an FTS5 query takes: `match`, a flat
+** OR of its terms, one phrase each, and `rank`, 'bm25w(w0, w1, ...)' with the
+** weights in phrase order, both ordered by term, so a phrase and its weight
+** cannot come apart. `terms` is how many feedback terms were kept. With no
+** feedback term and no query token, match and rank are NULL. The hidden columns
+** default to expand 10, common 0.1, shortest 2, longest 20 and mix 0.5. */
+typedef struct { const char *z; int n; int c; double w; } Rm3Term;
+typedef struct {
+  char *a; i64 nA, nAlloc;          /* token bytes, back to back */
+  i64 *aOff; int *aLen; int nT, nTAlloc;
+  int bFilter, nShort, nLong;       /* keep only [a-z0-9] tokens of this length */
+  int rc;
+} Rm3Tokens;
+typedef struct {
+  sqlite3_vtab base;
+  sqlite3 *db;
+  Fts5Global *pGlobal;
+  char *zDb, *zTbl;
+  int bBusy;
+} Rm3Table;
+typedef struct {
+  sqlite3_vtab_cursor base;
+  sqlite3_stmt *pStmt;              /* holds the FTS5 table open, as fts5vocab does */
+  Fts5Table *pFts5;
+  i64 nRow;                         /* the table's rows, which `common` is a share of */
+  char *zMatch, *zRank;
+  i64 nTerms;
+  int bEof;
+} Rm3Cursor;
+
+enum { RM3_MATCH, RM3_RANK, RM3_TERMS, RM3_FEEDBACK, RM3_QUERY, RM3_EXPAND,
+       RM3_COMMON, RM3_SHORTEST, RM3_LONGEST, RM3_MIX };
+
+static int rm3_tok_cb(void *p, int f, const char *t, int n, int s, int e) {
+  Rm3Tokens *k = p; (void)f; (void)s; (void)e;
+  if (k->bFilter) {
+    if (n < k->nShort || n > k->nLong) return SQLITE_OK;
+    for (int i = 0; i < n; i++)
+      if (!((t[i] >= 'a' && t[i] <= 'z') || (t[i] >= '0' && t[i] <= '9'))) return SQLITE_OK;
+  }
+  if (k->nA + n > k->nAlloc) {
+    i64 m = k->nAlloc ? k->nAlloc * 2 : 4096; while (m < k->nA + n) m *= 2;
+    char *a = sqlite3_realloc64(k->a, m); if (!a) return k->rc = SQLITE_NOMEM;
+    k->a = a; k->nAlloc = m;
+  }
+  if (k->nT >= k->nTAlloc) {
+    int m = k->nTAlloc ? k->nTAlloc * 2 : 256;
+    i64 *o = sqlite3_realloc64(k->aOff, m * sizeof(i64)); if (!o) return k->rc = SQLITE_NOMEM;
+    k->aOff = o;
+    int *l = sqlite3_realloc64(k->aLen, m * sizeof(int)); if (!l) return k->rc = SQLITE_NOMEM;
+    k->aLen = l; k->nTAlloc = m;
+  }
+  memcpy(k->a + k->nA, t, n); k->aOff[k->nT] = k->nA; k->aLen[k->nT] = n; k->nT++; k->nA += n;
+  return SQLITE_OK;
+}
+
+/* SQLite's BINARY order: bytes, then the shorter first. */
+static int rm3_cmp_term(const void *x, const void *y) {
+  const Rm3Term *a = x, *b = y;
+  int c = memcmp(a->z, b->z, a->n < b->n ? a->n : b->n);
+  return c ? c : a->n - b->n;
+}
+static int rm3_cmp_heavy(const void *x, const void *y) {
+  const Rm3Term *a = x, *b = y;
+  return a->c != b->c ? (a->c > b->c ? -1 : 1) : rm3_cmp_term(x, y);
+}
+
+/* A text's distinct tokens with their counts, in BINARY order. */
+static int rm3_count(Fts5Config *pConfig, const char *z, int n, Rm3Tokens *k, Rm3Term **paT, int *pnT) {
+  *paT = 0; *pnT = 0;
+  int rc = n > 0 ? sqlite3Fts5Tokenize(pConfig, FTS5_TOKENIZE_DOCUMENT, z, n, k, rm3_tok_cb) : SQLITE_OK;
+  if (rc == SQLITE_OK) rc = k->rc;
+  if (rc != SQLITE_OK || k->nT == 0) return rc;
+  Rm3Term *a = sqlite3_malloc64(k->nT * sizeof(Rm3Term));
+  if (!a) return SQLITE_NOMEM;
+  for (int i = 0; i < k->nT; i++) { a[i].z = k->a + k->aOff[i]; a[i].n = k->aLen[i]; a[i].c = 1; a[i].w = 0; }
+  qsort(a, k->nT, sizeof(Rm3Term), rm3_cmp_term);
+  int m = 0;
+  for (int i = 0; i < k->nT; i++) {
+    if (m > 0 && rm3_cmp_term(&a[m-1], &a[i]) == 0) a[m-1].c++;
+    else a[m++] = a[i];
+  }
+  *paT = a; *pnT = m;
+  return SQLITE_OK;
+}
+
+/* Whether more than nCap of the table's rows hold a term, counting only that far. */
+static int rm3_common(Fts5Index *pIndex, const char *z, int n, double nCap, int *pbCommon) {
+  Fts5IndexIter *pIter = 0; i64 nDoc = 0;
+  int rc = sqlite3Fts5IndexQuery(pIndex, z, n, FTS5INDEX_QUERY_NOTOKENDATA, 0, &pIter);
+  while (rc == SQLITE_OK && !sqlite3Fts5IterEof(pIter) && (double)nDoc <= nCap) {
+    nDoc++;
+    rc = sqlite3Fts5IterNext(pIter);
+  }
+  sqlite3Fts5IterClose(pIter);
+  *pbCommon = (double)nDoc > nCap;
+  return rc;
+}
+
+static int rm3Connect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
+                      sqlite3_vtab **ppVtab, char **pzErr) {
+  if (argc != 4 && argc != 5) {
+    *pzErr = sqlite3_mprintf("fts5rm3 takes the FTS5 table, as fts5rm3(table) or fts5rm3(schema, table)");
+    return SQLITE_ERROR;
+  }
+  int rc = sqlite3_declare_vtab(db, "CREATE TABLE x(match, rank, terms, feedback HIDDEN, query HIDDEN,"
+                                    " expand HIDDEN, common HIDDEN, shortest HIDDEN, longest HIDDEN, mix HIDDEN)");
+  if (rc != SQLITE_OK) return rc;
+  Rm3Table *p = sqlite3_malloc(sizeof(*p));
+  if (!p) return SQLITE_NOMEM;
+  memset(p, 0, sizeof(*p));
+  p->db = db; p->pGlobal = pAux;
+  p->zDb = sqlite3_mprintf("%s", argc == 5 ? argv[3] : "main");
+  p->zTbl = sqlite3_mprintf("%s", argv[argc - 1]);
+  if (!p->zDb || !p->zTbl) { sqlite3_free(p->zDb); sqlite3_free(p->zTbl); sqlite3_free(p); return SQLITE_NOMEM; }
+  sqlite3Fts5Dequote(p->zDb); sqlite3Fts5Dequote(p->zTbl);
+  *ppVtab = &p->base;
+  return SQLITE_OK;
+}
+static int rm3Disconnect(sqlite3_vtab *pVtab) {
+  Rm3Table *p = (Rm3Table*)pVtab;
+  sqlite3_free(p->zDb); sqlite3_free(p->zTbl); sqlite3_free(p);
+  return SQLITE_OK;
+}
+
+/* idxNum carries one bit per hidden column given, and argv holds them in column
+** order. The hidden columns are arguments, so a plan that cannot supply one it
+** names is refused, as json_each refuses one. */
+static int rm3BestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
+  (void)pVtab;
+  int aCon[RM3_MIX + 1]; for (int i = 0; i <= RM3_MIX; i++) aCon[i] = -1;
+  for (int i = 0; i < pInfo->nConstraint; i++) {
+    const struct sqlite3_index_constraint *c = &pInfo->aConstraint[i];
+    if (c->iColumn < RM3_FEEDBACK || c->op != SQLITE_INDEX_CONSTRAINT_EQ) continue;
+    if (!c->usable) return SQLITE_CONSTRAINT;
+    aCon[c->iColumn] = i;
+  }
+  if (aCon[RM3_FEEDBACK] < 0) return SQLITE_CONSTRAINT;
+  int iArg = 1, idxNum = 0;
+  for (int col = RM3_FEEDBACK; col <= RM3_MIX; col++) {
+    if (aCon[col] < 0) continue;
+    pInfo->aConstraintUsage[aCon[col]].argvIndex = iArg++;
+    pInfo->aConstraintUsage[aCon[col]].omit = 1;
+    idxNum |= 1 << (col - RM3_FEEDBACK);
+  }
+  pInfo->idxNum = idxNum;
+  pInfo->estimatedCost = 10.0;
+  pInfo->estimatedRows = 1;
+  pInfo->idxFlags = SQLITE_INDEX_SCAN_UNIQUE;
+  return SQLITE_OK;
+}
+
+static int rm3Open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCsr) {
+  Rm3Table *pTab = (Rm3Table*)pVtab;
+  if (pTab->bBusy) {
+    pVtab->zErrMsg = sqlite3_mprintf("recursive definition for %s.%s", pTab->zDb, pTab->zTbl);
+    return SQLITE_ERROR;
+  }
+  Rm3Cursor *pCsr = sqlite3_malloc(sizeof(*pCsr));
+  if (!pCsr) return SQLITE_NOMEM;
+  memset(pCsr, 0, sizeof(*pCsr));
+  int rc = SQLITE_OK;
+  char *zSql = sqlite3Fts5Mprintf(&rc, "SELECT t.%Q FROM %Q.%Q AS t WHERE t.%Q MATCH '*id'",
+                                  pTab->zTbl, pTab->zDb, pTab->zTbl, pTab->zTbl);
+  if (zSql) rc = sqlite3_prepare_v2(pTab->db, zSql, -1, &pCsr->pStmt, 0);
+  sqlite3_free(zSql);
+  if (rc == SQLITE_ERROR) rc = SQLITE_OK;
+  pTab->bBusy = 1;
+  if (pCsr->pStmt && sqlite3_step(pCsr->pStmt) == SQLITE_ROW)
+    pCsr->pFts5 = sqlite3Fts5TableFromCsrid(pTab->pGlobal, sqlite3_column_int64(pCsr->pStmt, 0));
+  pTab->bBusy = 0;
+  if (rc == SQLITE_OK && pCsr->pFts5 == 0) {
+    pVtab->zErrMsg = sqlite3_mprintf("no such fts5 table: %s.%s", pTab->zDb, pTab->zTbl);
+    rc = SQLITE_ERROR;
+  }
+  if (rc == SQLITE_OK) rc = sqlite3Fts5FlushToDisk(pCsr->pFts5);
+  /* The table's rows are its %_docsize rows, one per row indexed; FTS5's own
+  ** running total (the averages record bm25 reads) stands in only for a table
+  ** kept without them (columnsize=0). */
+  if (rc == SQLITE_OK && pCsr->pFts5->pConfig->bColumnsize) {
+    sqlite3_stmt *pCount = 0;
+    char *zCount = sqlite3_mprintf("SELECT count(*) FROM %Q.'%q_docsize'", pTab->zDb, pTab->zTbl);
+    rc = zCount ? sqlite3_prepare_v2(pTab->db, zCount, -1, &pCount, 0) : SQLITE_NOMEM;
+    sqlite3_free(zCount);
+    if (rc == SQLITE_OK && sqlite3_step(pCount) == SQLITE_ROW) pCsr->nRow = sqlite3_column_int64(pCount, 0);
+    int rcFinal = sqlite3_finalize(pCount);
+    if (rc == SQLITE_OK) rc = rcFinal;
+  } else if (rc == SQLITE_OK) {
+    rc = sqlite3Fts5StorageRowCount(((Fts5FullTable*)pCsr->pFts5)->pStorage, &pCsr->nRow);
+  }
+  if (rc != SQLITE_OK) { sqlite3_finalize(pCsr->pStmt); sqlite3_free(pCsr); return rc; }
+  *ppCsr = &pCsr->base;
+  return SQLITE_OK;
+}
+static void rm3Reset(Rm3Cursor *pCsr) {
+  sqlite3_free(pCsr->zMatch); sqlite3_free(pCsr->zRank);
+  pCsr->zMatch = pCsr->zRank = 0; pCsr->nTerms = 0; pCsr->bEof = 0;
+}
+static int rm3Close(sqlite3_vtab_cursor *pCursor) {
+  Rm3Cursor *pCsr = (Rm3Cursor*)pCursor;
+  rm3Reset(pCsr);
+  sqlite3_finalize(pCsr->pStmt);
+  sqlite3_free(pCsr);
+  return SQLITE_OK;
+}
+
+static int rm3Filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *idxStr, int argc, sqlite3_value **argv) {
+  Rm3Cursor *pCsr = (Rm3Cursor*)pCursor;
+  Fts5Table *pFts5 = pCsr->pFts5;
+  (void)idxStr; (void)argc;
+  rm3Reset(pCsr);
+  sqlite3_value *aVal[RM3_MIX + 1] = {0};
+  for (int col = RM3_FEEDBACK, i = 0; col <= RM3_MIX; col++)
+    if (idxNum & (1 << (col - RM3_FEEDBACK))) aVal[col] = argv[i++];
+  const char *zFb = aVal[RM3_FEEDBACK] ? (const char*)sqlite3_value_text(aVal[RM3_FEEDBACK]) : 0;
+  int nFb = zFb ? sqlite3_value_bytes(aVal[RM3_FEEDBACK]) : 0;
+  const char *zQ = aVal[RM3_QUERY] ? (const char*)sqlite3_value_text(aVal[RM3_QUERY]) : 0;
+  int nQ = zQ ? sqlite3_value_bytes(aVal[RM3_QUERY]) : 0;
+  int nExpand = aVal[RM3_EXPAND] ? sqlite3_value_int(aVal[RM3_EXPAND]) : 10;
+  double rCommon = aVal[RM3_COMMON] ? sqlite3_value_double(aVal[RM3_COMMON]) : 0.1;
+  int nShort = aVal[RM3_SHORTEST] ? sqlite3_value_int(aVal[RM3_SHORTEST]) : 2;
+  int nLong = aVal[RM3_LONGEST] ? sqlite3_value_int(aVal[RM3_LONGEST]) : 20;
+  double rMix = aVal[RM3_MIX] ? sqlite3_value_double(aVal[RM3_MIX]) : 0.5;
+
+  Rm3Tokens kq, kf;
+  memset(&kq, 0, sizeof(kq)); memset(&kf, 0, sizeof(kf));
+  kf.bFilter = 1; kf.nShort = nShort; kf.nLong = nLong;
+  Rm3Term *aQ = 0, *aF = 0, *aModel = 0;
+  int nQT = 0, nFT = 0, nKept = 0, nModel = 0;
+  i64 nRow = pCsr->nRow;
+
+  int rc = rm3_count(pFts5->pConfig, zQ, nQ, &kq, &aQ, &nQT);
+  if (rc == SQLITE_OK) rc = rm3_count(pFts5->pConfig, zFb, nFb, &kf, &aF, &nFT);
+
+  /* The heaviest first, so the rows are counted only for terms that might be kept. */
+  if (rc == SQLITE_OK && nFT > 0) {
+    qsort(aF, nFT, sizeof(Rm3Term), rm3_cmp_heavy);
+    for (int i = 0; rc == SQLITE_OK && i < nFT && nKept < nExpand; i++) {
+      int bCommon = 0;
+      rc = rm3_common(pFts5->pIndex, aF[i].z, aF[i].n, (double)nRow * rCommon, &bCommon);
+      if (rc == SQLITE_OK && !bCommon) aF[nKept++] = aF[i];
+    }
+  }
+
+  if (rc == SQLITE_OK && nQT + nKept > 0) {
+    aModel = sqlite3_malloc64((nQT + nKept) * sizeof(Rm3Term));
+    if (!aModel) rc = SQLITE_NOMEM;
+  }
+  if (rc == SQLITE_OK && aModel) {
+    i64 nQAll = 0, nFAll = 0;
+    for (int i = 0; i < nQT; i++) nQAll += aQ[i].c;
+    for (int i = 0; i < nKept; i++) nFAll += aF[i].c;
+    for (int i = 0; i < nQT; i++) { aModel[nModel] = aQ[i]; aModel[nModel++].w = rMix * ((double)aQ[i].c / (double)nQAll); }
+    for (int i = 0; i < nKept; i++) { aModel[nModel] = aF[i]; aModel[nModel++].w = rMix * ((double)aF[i].c / (double)nFAll); }
+    qsort(aModel, nModel, sizeof(Rm3Term), rm3_cmp_term);
+    int m = 0;
+    for (int i = 0; i < nModel; i++) {
+      if (m > 0 && rm3_cmp_term(&aModel[m-1], &aModel[i]) == 0) aModel[m-1].w += aModel[i].w;
+      else aModel[m++] = aModel[i];
+    }
+    nModel = m;
+    sqlite3_str *zM = sqlite3_str_new(0), *zR = sqlite3_str_new(0);
+    sqlite3_str_appendall(zR, "bm25w(");
+    for (int i = 0; i < nModel; i++) {
+      if (i) { sqlite3_str_appendall(zM, " OR "); sqlite3_str_appendall(zR, ", "); }
+      sqlite3_str_appendf(zM, "\"%.*s\"", aModel[i].n, aModel[i].z);
+      sqlite3_str_appendf(zR, "%.6f", aModel[i].w);
+    }
+    sqlite3_str_appendall(zR, ")");
+    pCsr->zMatch = sqlite3_str_finish(zM);
+    pCsr->zRank = sqlite3_str_finish(zR);
+    if (!pCsr->zMatch || !pCsr->zRank) rc = SQLITE_NOMEM;
+  }
+  pCsr->nTerms = nKept;
+
+  sqlite3_free(aQ); sqlite3_free(aF); sqlite3_free(aModel);
+  sqlite3_free(kq.a); sqlite3_free(kq.aOff); sqlite3_free(kq.aLen);
+  sqlite3_free(kf.a); sqlite3_free(kf.aOff); sqlite3_free(kf.aLen);
+  return rc;
+}
+static int rm3Next(sqlite3_vtab_cursor *pCursor) { ((Rm3Cursor*)pCursor)->bEof = 1; return SQLITE_OK; }
+static int rm3Eof(sqlite3_vtab_cursor *pCursor) { return ((Rm3Cursor*)pCursor)->bEof; }
+static int rm3Rowid(sqlite3_vtab_cursor *pCursor, sqlite3_int64 *pRowid) { (void)pCursor; *pRowid = 1; return SQLITE_OK; }
+static int rm3Column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, int i) {
+  Rm3Cursor *pCsr = (Rm3Cursor*)pCursor;
+  switch (i) {
+    case RM3_MATCH: if (pCsr->zMatch) sqlite3_result_text(ctx, pCsr->zMatch, -1, SQLITE_TRANSIENT); break;
+    case RM3_RANK: if (pCsr->zRank) sqlite3_result_text(ctx, pCsr->zRank, -1, SQLITE_TRANSIENT); break;
+    case RM3_TERMS: sqlite3_result_int64(ctx, pCsr->nTerms); break;
+    default: break;
+  }
+  return SQLITE_OK;
+}
+static sqlite3_module fts5x_rm3_module = {
+  0, rm3Connect, rm3Connect, rm3BestIndex, rm3Disconnect, rm3Disconnect,
+  rm3Open, rm3Close, rm3Filter, rm3Next, rm3Eof, rm3Column, rm3Rowid,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+};
+
 /* ---- Entry point ----------------------------------------------------- */
 int sqlite3_fts5x_init(sqlite3 *db, char **pzErrMsg,
                          const sqlite3_api_routines *pApi) {
@@ -232,6 +549,9 @@ int sqlite3_fts5x_init(sqlite3 *db, char **pzErrMsg,
   rc = pFtsApi->xCreateFunction(pFtsApi, "bm25w", 0, fts5x_bm25w, 0);
   if (rc != SQLITE_OK) return rc;
   rc = sqlite3Fts5TestRegisterTok(db, pFtsApi);
+  if (rc != SQLITE_OK) return rc;
+  /* fts5_api is the first member of FTS5's connection-wide Fts5Global. */
+  rc = sqlite3_create_module_v2(db, "fts5rm3", &fts5x_rm3_module, (Fts5Global*)pFtsApi, 0);
   if (rc != SQLITE_OK) return rc;
 
   Fts5ExtGlobal *g = sqlite3_malloc(sizeof(*g)); memset(g, 0, sizeof(*g));
