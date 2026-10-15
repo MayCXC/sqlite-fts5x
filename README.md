@@ -46,17 +46,25 @@ text's terms is a `GROUP BY token` over it.
 `fts5rm3` is relevance feedback for an FTS5 table, as [Anserini's
 Rm3Reranker](https://github.com/castorini/anserini/blob/master/src/main/java/io/anserini/rerank/lib/Rm3Reranker.java)
 builds it in explicit-feedback mode: a query model from the query's tokens, a feedback
-model from a text judged relevant, and the two mixed. Create one per FTS5 table and query
-it with the feedback text and the query:
+model from a document judged relevant, and the two mixed. Create one per FTS5 table and
+query it with the relevant row, or a feedback text, and the query:
 
     CREATE VIRTUAL TABLE temp.rm3 USING fts5rm3(docs);         -- main.docs
+    SELECT match, rank, terms FROM temp.rm3 WHERE relevant = ? AND query = ?;
     SELECT match, rank, terms FROM temp.rm3 WHERE feedback = ? AND query = ?;
 
     SELECT d.rowid FROM docs d, temp.rm3 r
-    WHERE r.feedback = ? AND r.query = ? AND d.docs MATCH r.match AND d.rank MATCH r.rank
+    WHERE r.relevant = ? AND r.query = ? AND d.docs MATCH r.match AND d.rank MATCH r.rank
     ORDER BY d.rank;
 
-The feedback model is the feedback text's tokens of `shortest` to `longest` `[a-z0-9]`
+`relevant` names the feedback document by its rowid in the table, as Anserini names one
+by its docid. The row is read the way FTS5 reads one for an auxiliary function, through
+its own content lookup by rowid, so an external content table reads only that row from
+its content table, and the row's indexed columns are the document. A NULL `relevant` is
+no document, which leaves the query's model alone. `feedback` gives the document as a
+text instead; a query takes one or the other.
+
+The feedback model is the feedback document's tokens of `shortest` to `longest` `[a-z0-9]`
 characters held by no more than `common` of the table's rows, the heaviest `expand` of
 them by count, each weighted by its share of those; the query model weights each query
 token by its share of them; the result is `mix` of each. Tokens come from the table's own

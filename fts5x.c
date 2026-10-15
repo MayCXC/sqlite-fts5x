@@ -213,11 +213,12 @@ done:
 **
 **   CREATE VIRTUAL TABLE temp.rm3 USING fts5rm3(fts);        -- main.fts
 **   CREATE VIRTUAL TABLE temp.rm3 USING fts5rm3(aux, fts);   -- aux.fts
+**   SELECT match, rank, terms FROM temp.rm3 WHERE relevant = ? AND query = ?;
 **   SELECT match, rank, terms FROM temp.rm3 WHERE feedback = ? AND query = ?;
 **
 ** RM3 in explicit-feedback mode, as Anserini's Rm3Reranker builds it. The query
 ** model is the query's tokens, each weighted by its share of them. The feedback
-** model is the feedback text's tokens of `shortest` to `longest` [a-z0-9]
+** model is the feedback document's tokens of `shortest` to `longest` [a-z0-9]
 ** characters held by no more than `common` of the table's rows, the heaviest
 ** `expand` of them by count, each weighted by its share of those. The final
 ** model is `mix` of each. Tokens come from the table's own tokenizer and a
@@ -225,6 +226,14 @@ done:
 ** term's rows are counted only until it proves common, and only until `expand`
 ** terms are kept, since the heaviest terms are tried first.
 ** https://github.com/castorini/anserini/blob/master/src/main/java/io/anserini/rerank/lib/Rm3Reranker.java
+**
+** The feedback document is a row of the table, named by its rowid in
+** `relevant`, as Anserini names a feedback document by its docid, or a text
+** given as `feedback`. A row is read the way FTS5 reads one for an auxiliary
+** function, through its own content lookup by rowid, so an external content
+** table's rowid constraint reaches its content table and only that row is
+** read, and its indexed columns are the document. A NULL `relevant` is no
+** document, so the model is the query's alone.
 **
 ** The model comes out as the two strings an FTS5 query takes: `match`, a flat
 ** OR of its terms, one phrase each, and `rank`, 'bm25w(w0, w1, ...)' with the
@@ -256,8 +265,8 @@ typedef struct {
   int bEof;
 } Rm3Cursor;
 
-enum { RM3_MATCH, RM3_RANK, RM3_TERMS, RM3_FEEDBACK, RM3_QUERY, RM3_EXPAND,
-       RM3_COMMON, RM3_SHORTEST, RM3_LONGEST, RM3_MIX };
+enum { RM3_MATCH, RM3_RANK, RM3_TERMS, RM3_FEEDBACK, RM3_RELEVANT, RM3_QUERY,
+       RM3_EXPAND, RM3_COMMON, RM3_SHORTEST, RM3_LONGEST, RM3_MIX };
 
 static int rm3_tok_cb(void *p, int f, const char *t, int n, int s, int e) {
   Rm3Tokens *k = p; (void)f; (void)s; (void)e;
@@ -293,12 +302,50 @@ static int rm3_cmp_heavy(const void *x, const void *y) {
   return a->c != b->c ? (a->c > b->c ? -1 : 1) : rm3_cmp_term(x, y);
 }
 
-/* A text's distinct tokens with their counts, in BINARY order. */
-static int rm3_count(Fts5Config *pConfig, const char *z, int n, Rm3Tokens *k, Rm3Term **paT, int *pnT) {
-  *paT = 0; *pnT = 0;
+/* A text's tokens, appended to k. */
+static int rm3_tokenize(Fts5Config *pConfig, const char *z, int n, Rm3Tokens *k) {
   int rc = n > 0 ? sqlite3Fts5Tokenize(pConfig, FTS5_TOKENIZE_DOCUMENT, z, n, k, rm3_tok_cb) : SQLITE_OK;
-  if (rc == SQLITE_OK) rc = k->rc;
-  if (rc != SQLITE_OK || k->nT == 0) return rc;
+  return rc == SQLITE_OK ? k->rc : rc;
+}
+
+/* The tokens of the table's row iRow, appended to k: each indexed column of the
+** row FTS5's content lookup returns, as fts5SeekCursor reads a row for an
+** auxiliary function. A rowid naming no row is an error, as it is for vec0's
+** rocchio, since a document that is not there cannot be judged relevant. */
+static int rm3_row(Fts5Table *pFts5, i64 iRow, Rm3Tokens *k, char **pzErr) {
+  Fts5Config *pConfig = pFts5->pConfig;
+  if (pConfig->eContent == FTS5_CONTENT_NONE) {
+    *pzErr = sqlite3_mprintf("fts5rm3: %s is contentless, so no row of it can be read as feedback", pConfig->zName);
+    return SQLITE_ERROR;
+  }
+  Fts5Storage *pStorage = ((Fts5FullTable*)pFts5)->pStorage;
+  sqlite3_stmt *pLookup = 0;
+  int rc = sqlite3Fts5StorageStmt(pStorage, FTS5_STMT_LOOKUP, &pLookup, pzErr);
+  if (rc != SQLITE_OK) return rc;
+  sqlite3_bind_int64(pLookup, 1, iRow);
+  pConfig->bLock++;
+  int rcStep = sqlite3_step(pLookup);
+  pConfig->bLock--;
+  if (rcStep == SQLITE_ROW) {
+    for (int i = 0; rc == SQLITE_OK && i < pConfig->nCol; i++) {
+      if (pConfig->abUnindexed[i]) continue;
+      const char *z = (const char*)sqlite3_column_text(pLookup, i + 1);
+      rc = rm3_tokenize(pConfig, z, sqlite3_column_bytes(pLookup, i + 1), k);
+    }
+  } else if (rcStep == SQLITE_DONE) {
+    *pzErr = sqlite3_mprintf("fts5rm3: no row %lld in %s to read as feedback", iRow, pConfig->zName);
+    rc = SQLITE_ERROR;
+  }
+  int rcReset = sqlite3_reset(pLookup);
+  if (rc == SQLITE_OK) rc = rcReset;
+  sqlite3Fts5StorageStmtRelease(pStorage, FTS5_STMT_LOOKUP, pLookup);
+  return rc;
+}
+
+/* The distinct tokens in k with their counts, in BINARY order. */
+static int rm3_count(Rm3Tokens *k, Rm3Term **paT, int *pnT) {
+  *paT = 0; *pnT = 0;
+  if (k->nT == 0) return SQLITE_OK;
   Rm3Term *a = sqlite3_malloc64(k->nT * sizeof(Rm3Term));
   if (!a) return SQLITE_NOMEM;
   for (int i = 0; i < k->nT; i++) { a[i].z = k->a + k->aOff[i]; a[i].n = k->aLen[i]; a[i].c = 1; a[i].w = 0; }
@@ -331,8 +378,9 @@ static int rm3Connect(sqlite3 *db, void *pAux, int argc, const char *const *argv
     *pzErr = sqlite3_mprintf("fts5rm3 takes the FTS5 table, as fts5rm3(table) or fts5rm3(schema, table)");
     return SQLITE_ERROR;
   }
-  int rc = sqlite3_declare_vtab(db, "CREATE TABLE x(match, rank, terms, feedback HIDDEN, query HIDDEN,"
-                                    " expand HIDDEN, common HIDDEN, shortest HIDDEN, longest HIDDEN, mix HIDDEN)");
+  int rc = sqlite3_declare_vtab(db, "CREATE TABLE x(match, rank, terms, feedback HIDDEN, relevant HIDDEN,"
+                                    " query HIDDEN, expand HIDDEN, common HIDDEN, shortest HIDDEN, longest HIDDEN,"
+                                    " mix HIDDEN)");
   if (rc != SQLITE_OK) return rc;
   Rm3Table *p = sqlite3_malloc(sizeof(*p));
   if (!p) return SQLITE_NOMEM;
@@ -353,7 +401,8 @@ static int rm3Disconnect(sqlite3_vtab *pVtab) {
 
 /* idxNum carries one bit per hidden column given, and argv holds them in column
 ** order. The hidden columns are arguments, so a plan that cannot supply one it
-** names is refused, as json_each refuses one. */
+** names is refused, as json_each refuses one, and so is a plan with neither
+** feedback form. */
 static int rm3BestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
   (void)pVtab;
   int aCon[RM3_MIX + 1]; for (int i = 0; i <= RM3_MIX; i++) aCon[i] = -1;
@@ -363,7 +412,7 @@ static int rm3BestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
     if (!c->usable) return SQLITE_CONSTRAINT;
     aCon[c->iColumn] = i;
   }
-  if (aCon[RM3_FEEDBACK] < 0) return SQLITE_CONSTRAINT;
+  if (aCon[RM3_FEEDBACK] < 0 && aCon[RM3_RELEVANT] < 0) return SQLITE_CONSTRAINT;
   int iArg = 1, idxNum = 0;
   for (int col = RM3_FEEDBACK; col <= RM3_MIX; col++) {
     if (aCon[col] < 0) continue;
@@ -450,6 +499,17 @@ static int rm3Filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *idxSt
   int nLong = aVal[RM3_LONGEST] ? sqlite3_value_int(aVal[RM3_LONGEST]) : 20;
   double rMix = aVal[RM3_MIX] ? sqlite3_value_double(aVal[RM3_MIX]) : 0.5;
 
+  sqlite3_value *pRel = aVal[RM3_RELEVANT];
+  int bRel = pRel && sqlite3_value_type(pRel) != SQLITE_NULL;
+  if (bRel && aVal[RM3_FEEDBACK]) {
+    pCursor->pVtab->zErrMsg = sqlite3_mprintf("fts5rm3 takes its feedback as a row or as a text, not both");
+    return SQLITE_ERROR;
+  }
+  if (bRel && sqlite3_value_numeric_type(pRel) != SQLITE_INTEGER) {
+    pCursor->pVtab->zErrMsg = sqlite3_mprintf("fts5rm3: relevant must be a rowid");
+    return SQLITE_ERROR;
+  }
+
   Rm3Tokens kq, kf;
   memset(&kq, 0, sizeof(kq)); memset(&kf, 0, sizeof(kf));
   kf.bFilter = 1; kf.nShort = nShort; kf.nLong = nLong;
@@ -457,8 +517,13 @@ static int rm3Filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *idxSt
   int nQT = 0, nFT = 0, nKept = 0, nModel = 0;
   i64 nRow = pCsr->nRow;
 
-  int rc = rm3_count(pFts5->pConfig, zQ, nQ, &kq, &aQ, &nQT);
-  if (rc == SQLITE_OK) rc = rm3_count(pFts5->pConfig, zFb, nFb, &kf, &aF, &nFT);
+  int rc = rm3_tokenize(pFts5->pConfig, zQ, nQ, &kq);
+  if (rc == SQLITE_OK) rc = rm3_count(&kq, &aQ, &nQT);
+  if (rc == SQLITE_OK) {
+    rc = bRel ? rm3_row(pFts5, sqlite3_value_int64(pRel), &kf, &pCursor->pVtab->zErrMsg)
+              : rm3_tokenize(pFts5->pConfig, zFb, nFb, &kf);
+  }
+  if (rc == SQLITE_OK) rc = rm3_count(&kf, &aF, &nFT);
 
   /* The heaviest first, so the rows are counted only for terms that might be kept. */
   if (rc == SQLITE_OK && nFT > 0) {
