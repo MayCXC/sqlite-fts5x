@@ -35,6 +35,19 @@ SQLITE_EXTENSION_INIT1
 #include "fts5_varint.c"
 #include "fts5_vocab.c"
 
+/* fts5tokenize: a tokenizer's output as rows (input HIDDEN, token, start, end,
+** position). SQLite compiles this file only into its test harness, so its
+** guard is met here for this one file and released after it, and the unused
+** parameters its methods leave unmarked are not reported under -Wextra. */
+#define SQLITE_TEST
+#define SQLITE_ENABLE_FTS5
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#include "fts5_test_tok.c"
+#pragma GCC diagnostic pop
+#undef SQLITE_ENABLE_FTS5
+#undef SQLITE_TEST
+
 /* ---- match_tokens() -------------------------------------------------- */
 static void fts5x_match_tokens(const Fts5ExtensionApi *pApi,
     Fts5Context *pFts, sqlite3_context *pCtx, int nVal, sqlite3_value **apVal) {
@@ -217,6 +230,8 @@ int sqlite3_fts5x_init(sqlite3 *db, char **pzErrMsg,
   rc = pFtsApi->xCreateFunction(pFtsApi, "match_position", 0, fts5x_match_position, 0);
   if (rc != SQLITE_OK) return rc;
   rc = pFtsApi->xCreateFunction(pFtsApi, "bm25w", 0, fts5x_bm25w, 0);
+  if (rc != SQLITE_OK) return rc;
+  rc = sqlite3Fts5TestRegisterTok(db, pFtsApi);
   if (rc != SQLITE_OK) return rc;
 
   Fts5ExtGlobal *g = sqlite3_malloc(sizeof(*g)); memset(g, 0, sizeof(*g));

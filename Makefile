@@ -49,7 +49,8 @@ install: $(TARGET)
 # auxiliary function cannot be called inside an aggregate, so each check scores
 # the rows in a MATERIALIZED CTE and aggregates over it. bm25w is compared with
 # bm25 within 1e-12: the two may round differently where the compiler fuses a
-# multiply and an add.
+# multiply and an add. fts5tokenize's rows are compared, in order, with the
+# terms the index records for the same text and with tokenize().
 test: $(TARGET)
 	@echo "=== bm25w (each check fails the target) ==="
 	sqlite3 -bail :memory: ".load ./fts5x sqlite3_fts5x_init" \
@@ -60,5 +61,14 @@ test: $(TARGET)
 	  "WITH s AS MATERIALIZED (SELECT bm25w(d, 2.0, 0.5, 9.0) AS x, bm25w(d, 2.0, 0.5) AS y FROM d WHERE d MATCH 'cat OR dog') SELECT 'a weight past the last phrase is unused: ' || CASE WHEN count(*) = 4 AND max(abs(x - y)) = 0 THEN 'ok' ELSE abs(-9223372036854775808) END FROM s;" \
 	  "WITH u AS MATERIALIZED (SELECT rowid FROM d WHERE d MATCH 'cat OR dog' ORDER BY bm25(d), rowid), v AS MATERIALIZED (SELECT rowid FROM d WHERE d MATCH 'cat OR dog' ORDER BY bm25w(d, 2.0, 0.5), rowid) SELECT 'the weights reorder this fixture: ' || CASE WHEN (SELECT group_concat(rowid) FROM u) <> (SELECT group_concat(rowid) FROM v) THEN 'ok' ELSE abs(-9223372036854775808) END;" \
 	  "WITH r AS MATERIALIZED (SELECT rowid, rank FROM d WHERE d MATCH 'cat OR dog' AND rank MATCH 'bm25w(2.0, 0.5)' ORDER BY rank, rowid), s AS MATERIALIZED (SELECT rowid, bm25w(d, 2.0, 0.5) AS s FROM d WHERE d MATCH 'cat OR dog' ORDER BY s, rowid) SELECT 'rank MATCH ranks by it: ' || CASE WHEN (SELECT group_concat(rowid || ':' || printf('%.12f', rank)) FROM r) = (SELECT group_concat(rowid || ':' || printf('%.12f', s)) FROM s) THEN 'ok' ELSE abs(-9223372036854775808) END;"
+	@echo "=== fts5tokenize (each check fails the target) ==="
+	sqlite3 -bail :memory: ".load ./fts5x sqlite3_fts5x_init" \
+	  "CREATE VIRTUAL TABLE d USING fts5x(body);" \
+	  "INSERT INTO d(rowid, body) VALUES (1, 'Le Café au LAIT, café-au-lait! 42 Ünïcode words; words & WORDS.');" \
+	  "CREATE VIRTUAL TABLE v USING fts5vocab(d, instance);" \
+	  "CREATE VIRTUAL TABLE t USING fts5tokenize;" \
+	  "SELECT 'its rows are the terms the index records: ' || CASE WHEN (SELECT group_concat(term, ' ' ORDER BY offset) FROM v WHERE doc = 1) = (SELECT group_concat(token, ' ' ORDER BY position) FROM t WHERE input = (SELECT body FROM d WHERE rowid = 1)) THEN 'ok' ELSE abs(-9223372036854775808) END;" \
+	  "SELECT 'they are tokenize()''s tokens: ' || CASE WHEN (SELECT group_concat(token, ' ' ORDER BY position) FROM t WHERE input = (SELECT body FROM d WHERE rowid = 1)) = (SELECT tokenize(body) FROM d WHERE rowid = 1) THEN 'ok' ELSE abs(-9223372036854775808) END;" \
+	  "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100000) SELECT 'a 100,000-token text is 100,000 rows: ' || CASE WHEN (SELECT count(*) FROM t WHERE input = (SELECT group_concat('w' || i, ' ') FROM n)) = 100000 THEN 'ok' ELSE abs(-9223372036854775808) END;"
 
 .PHONY: clean distclean install test vendor

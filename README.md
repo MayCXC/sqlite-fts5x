@@ -27,11 +27,26 @@ hit's byte range, so a seekable store like [`sqlite-zstd`](https://github.com/Ma
 can decompress just the snippet, and `match_tokens` gives clean tokens for a reranker like
 [`sqlite-mmr`](https://github.com/MayCXC/sqlite-mmr), neither reading the full document.
 
+## Tokenizer table
+
+`fts5tokenize` is the module SQLite's FTS5 sources define for reading a tokenizer's output as
+rows (`ext/fts5/fts5_test_tok.c`, which SQLite builds only into its test harness). Create one
+per tokenizer, the tokenizer's name and each of its arguments given as a module argument
+(none for FTS5's default), and query it by `input`:
+
+    CREATE VIRTUAL TABLE temp.tok USING fts5tokenize;   -- FTS5's default tokenizer
+    CREATE VIRTUAL TABLE temp.raw USING fts5tokenize(unicode61, remove_diacritics, 0);
+    SELECT token, start, end, position FROM temp.tok WHERE input = 'Some text';
+
+Each row is one token, its byte range in the input and its token position, so counting a
+text's terms is a `GROUP BY token` over it.
+
 ## Build
 
     make vendor   # fetch SQLite's fts5 sources and apply patches/fts5x.patch
     make          # -> fts5x.so
-    make test     # checks bm25w against bm25 with the sqlite3 shell
+    make test     # checks bm25w against bm25, and fts5tokenize against the index and
+                  # tokenize(), with the sqlite3 shell
 
 `make vendor` downloads the pinned SQLite amalgamation (`SQLITE_VERSION` in the
 Makefile), extracts the FTS5 sources and the `lemon` parser tool, and applies
