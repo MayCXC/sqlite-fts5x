@@ -64,6 +64,12 @@ its content table, and the row's indexed columns are the document. A NULL `relev
 no document, which leaves the query's model alone. `feedback` gives the document as a
 text instead; a query takes one or the other.
 
+`nonrelevant` names a row judged not relevant, the document Rocchio's third term takes
+([Introduction to Information Retrieval, 9.1.1](https://nlp.stanford.edu/IR-book/html/htmledition/the-rocchio71-algorithm-1.html)):
+its tokens leave the feedback model before the heaviest are kept, so the model is what
+the feedback document says that this row does not. The query's tokens stay. This one is
+ours; Anserini's RM3 takes no non-relevant document.
+
 The feedback model is the feedback document's tokens of `shortest` to `longest` `[a-z0-9]`
 characters held by no more than `common` of the table's rows, the heaviest `expand` of
 them by count, each weighted by its share of those; the query model weights each query

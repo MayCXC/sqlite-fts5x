@@ -235,6 +235,13 @@ done:
 ** read, and its indexed columns are the document. A NULL `relevant` is no
 ** document, so the model is the query's alone.
 **
+** A row given as `nonrelevant` is a document judged not relevant, the one
+** Rocchio's third term takes (https://nlp.stanford.edu/IR-book/html/htmledition/the-rocchio71-algorithm-1.html):
+** its tokens leave the feedback model before the heaviest are kept, so the
+** model is what the feedback document says that this one does not. This is ours;
+** Anserini's RM3 has no non-relevant document. A NULL `nonrelevant` removes
+** nothing, and the query's tokens are never removed.
+**
 ** The model comes out as the two strings an FTS5 query takes: `match`, a flat
 ** OR of its terms, one phrase each, and `rank`, 'bm25w(w0, w1, ...)' with the
 ** weights in phrase order, both ordered by term, so a phrase and its weight
@@ -266,7 +273,7 @@ typedef struct {
 } Rm3Cursor;
 
 enum { RM3_MATCH, RM3_RANK, RM3_TERMS, RM3_FEEDBACK, RM3_RELEVANT, RM3_QUERY,
-       RM3_EXPAND, RM3_COMMON, RM3_SHORTEST, RM3_LONGEST, RM3_MIX };
+       RM3_EXPAND, RM3_COMMON, RM3_SHORTEST, RM3_LONGEST, RM3_MIX, RM3_NONRELEVANT };
 
 static int rm3_tok_cb(void *p, int f, const char *t, int n, int s, int e) {
   Rm3Tokens *k = p; (void)f; (void)s; (void)e;
@@ -380,7 +387,7 @@ static int rm3Connect(sqlite3 *db, void *pAux, int argc, const char *const *argv
   }
   int rc = sqlite3_declare_vtab(db, "CREATE TABLE x(match, rank, terms, feedback HIDDEN, relevant HIDDEN,"
                                     " query HIDDEN, expand HIDDEN, common HIDDEN, shortest HIDDEN, longest HIDDEN,"
-                                    " mix HIDDEN)");
+                                    " mix HIDDEN, nonrelevant HIDDEN)");
   if (rc != SQLITE_OK) return rc;
   Rm3Table *p = sqlite3_malloc(sizeof(*p));
   if (!p) return SQLITE_NOMEM;
@@ -405,7 +412,7 @@ static int rm3Disconnect(sqlite3_vtab *pVtab) {
 ** feedback form. */
 static int rm3BestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
   (void)pVtab;
-  int aCon[RM3_MIX + 1]; for (int i = 0; i <= RM3_MIX; i++) aCon[i] = -1;
+  int aCon[RM3_NONRELEVANT + 1]; for (int i = 0; i <= RM3_NONRELEVANT; i++) aCon[i] = -1;
   for (int i = 0; i < pInfo->nConstraint; i++) {
     const struct sqlite3_index_constraint *c = &pInfo->aConstraint[i];
     if (c->iColumn < RM3_FEEDBACK || c->op != SQLITE_INDEX_CONSTRAINT_EQ) continue;
@@ -414,7 +421,7 @@ static int rm3BestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
   }
   if (aCon[RM3_FEEDBACK] < 0 && aCon[RM3_RELEVANT] < 0) return SQLITE_CONSTRAINT;
   int iArg = 1, idxNum = 0;
-  for (int col = RM3_FEEDBACK; col <= RM3_MIX; col++) {
+  for (int col = RM3_FEEDBACK; col <= RM3_NONRELEVANT; col++) {
     if (aCon[col] < 0) continue;
     pInfo->aConstraintUsage[aCon[col]].argvIndex = iArg++;
     pInfo->aConstraintUsage[aCon[col]].omit = 1;
@@ -486,8 +493,8 @@ static int rm3Filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *idxSt
   Fts5Table *pFts5 = pCsr->pFts5;
   (void)idxStr; (void)argc;
   rm3Reset(pCsr);
-  sqlite3_value *aVal[RM3_MIX + 1] = {0};
-  for (int col = RM3_FEEDBACK, i = 0; col <= RM3_MIX; col++)
+  sqlite3_value *aVal[RM3_NONRELEVANT + 1] = {0};
+  for (int col = RM3_FEEDBACK, i = 0; col <= RM3_NONRELEVANT; col++)
     if (idxNum & (1 << (col - RM3_FEEDBACK))) aVal[col] = argv[i++];
   const char *zFb = aVal[RM3_FEEDBACK] ? (const char*)sqlite3_value_text(aVal[RM3_FEEDBACK]) : 0;
   int nFb = zFb ? sqlite3_value_bytes(aVal[RM3_FEEDBACK]) : 0;
@@ -509,12 +516,19 @@ static int rm3Filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *idxSt
     pCursor->pVtab->zErrMsg = sqlite3_mprintf("fts5rm3: relevant must be a rowid");
     return SQLITE_ERROR;
   }
+  sqlite3_value *pNon = aVal[RM3_NONRELEVANT];
+  int bNon = pNon && sqlite3_value_type(pNon) != SQLITE_NULL;
+  if (bNon && sqlite3_value_numeric_type(pNon) != SQLITE_INTEGER) {
+    pCursor->pVtab->zErrMsg = sqlite3_mprintf("fts5rm3: nonrelevant must be a rowid");
+    return SQLITE_ERROR;
+  }
 
-  Rm3Tokens kq, kf;
-  memset(&kq, 0, sizeof(kq)); memset(&kf, 0, sizeof(kf));
+  Rm3Tokens kq, kf, kn;
+  memset(&kq, 0, sizeof(kq)); memset(&kf, 0, sizeof(kf)); memset(&kn, 0, sizeof(kn));
   kf.bFilter = 1; kf.nShort = nShort; kf.nLong = nLong;
-  Rm3Term *aQ = 0, *aF = 0, *aModel = 0;
-  int nQT = 0, nFT = 0, nKept = 0, nModel = 0;
+  kn.bFilter = 1; kn.nShort = nShort; kn.nLong = nLong;
+  Rm3Term *aQ = 0, *aF = 0, *aN = 0, *aModel = 0;
+  int nQT = 0, nFT = 0, nNT = 0, nKept = 0, nModel = 0;
   i64 nRow = pCsr->nRow;
 
   int rc = rm3_tokenize(pFts5->pConfig, zQ, nQ, &kq);
@@ -524,11 +538,14 @@ static int rm3Filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *idxSt
               : rm3_tokenize(pFts5->pConfig, zFb, nFb, &kf);
   }
   if (rc == SQLITE_OK) rc = rm3_count(&kf, &aF, &nFT);
+  if (rc == SQLITE_OK && bNon) rc = rm3_row(pFts5, sqlite3_value_int64(pNon), &kn, &pCursor->pVtab->zErrMsg);
+  if (rc == SQLITE_OK) rc = rm3_count(&kn, &aN, &nNT);
 
   /* The heaviest first, so the rows are counted only for terms that might be kept. */
   if (rc == SQLITE_OK && nFT > 0) {
     qsort(aF, nFT, sizeof(Rm3Term), rm3_cmp_heavy);
     for (int i = 0; rc == SQLITE_OK && i < nFT && nKept < nExpand; i++) {
+      if (nNT > 0 && bsearch(&aF[i], aN, nNT, sizeof(Rm3Term), rm3_cmp_term)) continue;
       int bCommon = 0;
       rc = rm3_common(pFts5->pIndex, aF[i].z, aF[i].n, (double)nRow * rCommon, &bCommon);
       if (rc == SQLITE_OK && !bCommon) aF[nKept++] = aF[i];
@@ -566,9 +583,10 @@ static int rm3Filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *idxSt
   }
   pCsr->nTerms = nKept;
 
-  sqlite3_free(aQ); sqlite3_free(aF); sqlite3_free(aModel);
+  sqlite3_free(aQ); sqlite3_free(aF); sqlite3_free(aN); sqlite3_free(aModel);
   sqlite3_free(kq.a); sqlite3_free(kq.aOff); sqlite3_free(kq.aLen);
   sqlite3_free(kf.a); sqlite3_free(kf.aOff); sqlite3_free(kf.aLen);
+  sqlite3_free(kn.a); sqlite3_free(kn.aOff); sqlite3_free(kn.aLen);
   return rc;
 }
 static int rm3Next(sqlite3_vtab_cursor *pCursor) { ((Rm3Cursor*)pCursor)->bEof = 1; return SQLITE_OK; }
